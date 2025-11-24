@@ -1,6 +1,9 @@
 const crypto = require('crypto');
 if (!global.crypto) { global.crypto = crypto; }
 
+const WebSocket = require('ws');
+if (!global.WebSocket) { global.WebSocket = WebSocket; }
+
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers } = require('@whiskeysockets/baileys');
 const { createClient } = require('@supabase/supabase-js');
 const express = require('express');
@@ -87,7 +90,14 @@ async function connectToWhatsApp() {
 
 // --- SUPABASE (VERSIÓN BLINDADA) ---
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
-    auth: { persistSession: false }
+    auth: { persistSession: false },
+    realtime: {
+        params: {
+            eventsPerSecond: 10,
+        },
+        timeout: 30000, // Darle 30 segundos antes de rendirse (antes era 10s)
+        heartbeatIntervalMs: 5000, // Latido cada 5s para mantener vivo
+    }
 });
 
 let isReconnectingDB = false;
