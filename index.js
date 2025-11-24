@@ -113,19 +113,22 @@ async function setupSupabaseListener() {
 
     isReconnectingDB = false; // Reiniciamos la bandera
     console.log("🎧 Iniciando escucha de base de datos...");
-
-    const channel = supabase.channel('bot_turnos_v3');
-
-    channel
+    const channelName = `bot_turnos_${Date.now()}`;
+    const channel = supabase.channel(channelName)
         .on(
             'postgres_changes',
             { event: 'UPDATE', schema: 'public', table: 'turnos' },
             async (payload) => {
-                // Lógica de notificación
+                // 1. LOG DE DEPURACIÓN (¡Esto es lo que necesitamos ver!)
+                console.log("📨 PAYLOAD RECIBIDO:", JSON.stringify(payload));
+
                 const newTurn = payload.new;
-                const oldTurn = payload.old;
-                if (oldTurn.estado === 'en espera' && newTurn.estado === 'en atencion') {
-                    console.log(`🔔 Turno llamado: ${newTurn.prefijo_turno}-${newTurn.numero_turno}`);
+                
+                // 2. CONDICIÓN RELAJADA
+                // Si el estado NUEVO es 'en atencion', intentamos notificar.
+                // Quitamos la dependencia estricta de 'old' por si acaso.
+                if (newTurn.estado === 'en atencion') {
+                    console.log(`🔔 Detectado turno en atención: ${newTurn.prefijo_turno}-${newTurn.numero_turno}`);
                     await notifyUser(newTurn);
                 }
             }
