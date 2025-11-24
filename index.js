@@ -73,14 +73,18 @@ async function connectToWhatsApp() {
 
             // CORRECCIÓN: Si es error 405, la sesión está corrupta. Borramos y reiniciamos.
             if (statusCode === 405) {
-                console.log("⚠️ Error 405 detectado. Credenciales corruptas. Reiniciando sesión limpia...");
+                console.log("⚠️ Error 405 (Sesión Inválida). Borrando credenciales y reiniciando contenedor...");
                 try {
+                    // Borramos la carpeta de sesión
                     fs.rmSync('auth_info_baileys', { recursive: true, force: true });
+                    console.log("✅ Carpeta 'auth_info_baileys' eliminada.");
                 } catch (e) {
-                    console.error("No se pudo borrar carpeta auth:", e);
+                    console.error("❌ Fallo al borrar carpeta:", e);
                 }
-                // Esperamos un poco más antes de reintentar para no saturar
-                setTimeout(connectToWhatsApp, 3000);
+                
+                // ¡AQUÍ ESTÁ EL TRUCO! Matamos el proceso.
+                // Render detectará que se cerró y lo volverá a arrancar limpio en unos segundos.
+                process.exit(1); 
                 return;
             }
 
