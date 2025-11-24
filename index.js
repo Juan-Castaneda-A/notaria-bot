@@ -11,9 +11,13 @@ const QRCode = require('qrcode');
 const pino = require('pino');
 const fs = require('fs');
 
-const PORT = process.env.PORT || 10000; // Render usa el puerto 10000 a veces
+const PORT = process.env.PORT || 10000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
+
+console.log("--- INICIANDO BOT ---");
+console.log(`URL Supabase: ${SUPABASE_URL}`);
+console.log(`Key (primeros 10): ${SUPABASE_KEY ? SUPABASE_KEY.substring(0, 10) + '...' : 'NO DEFINIDA'}`);
 
 if (!SUPABASE_URL || !SUPABASE_KEY) {
     console.error("❌ Faltan variables de entorno.");
@@ -37,18 +41,22 @@ app.get('/', async (req, res) => {
 
 app.get('/test', async (req, res) => {
     const phone = req.query.phone;
+    console.log(`🧪 Petición de prueba recibida para: ${phone}`);
     if (!phone || !sock) return res.send("Error: Sin teléfono o bot desconectado");
     try {
         const jid = phone + '@s.whatsapp.net';
         await sock.sendMessage(jid, { text: "🔔 Prueba de vida exitosa." });
+        console.log(`✅ Mensaje de prueba enviado a ${phone}`);
         res.send(`Mensaje enviado a ${phone}`);
     } catch (e) {
+        console.error(`❌ Error en prueba: ${e.message}`);
         res.send(`Error: ${e.message}`);
     }
 });
 
 // --- WHATSAPP ---
 async function connectToWhatsApp() {
+    console.log("🔄 Iniciando conexión con WhatsApp...");
     const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
     
     sock = makeWASocket({
@@ -65,10 +73,7 @@ async function connectToWhatsApp() {
 
         if (connection === 'close') {
             const statusCode = (lastDisconnect?.error)?.output?.statusCode;
-            // Ignoramos el error 515 (Restart Required), es normal
-            if (statusCode !== 515) {
-                console.log(`❌ WhatsApp Cerrado. Código: ${statusCode}`);
-            }
+            if (statusCode !== 515) console.log(`❌ WhatsApp Cerrado. Código: ${statusCode}`);
             
             if (statusCode === 405) {
                 console.log("⚠️ Error 405. Limpiando sesión...");
@@ -80,7 +85,7 @@ async function connectToWhatsApp() {
             else isConnected = false;
 
         } else if (connection === 'open') {
-            console.log('✅ ¡WhatsApp Conectado exitosamente!');
+            console.log('✅ WhatsApp Conectado exitosamente');
             isConnected = true;
             qrCodeData = null;
         }
@@ -88,93 +93,98 @@ async function connectToWhatsApp() {
     sock.ev.on('creds.update', saveCreds);
 }
 
-// --- SUPABASE (VERSIÓN BLINDADA) ---
+// --- SUPABASE (LOGGING EXTREMO) ---
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
     auth: { persistSession: false },
     realtime: {
-        params: {
-            eventsPerSecond: 10,
-        },
-        timeout: 30000, // Darle 30 segundos antes de rendirse (antes era 10s)
-        heartbeatIntervalMs: 5000, // Latido cada 5s para mantener vivo
+        params: { eventsPerSecond: 10 },
+        timeout: 30000
     }
 });
 
-let isReconnectingDB = false;
-
 async function setupSupabaseListener() {
-    // 1. Limpieza "Nuclear": Borrar TODOS los canales previos para evitar fantasmas
     try {
         await supabase.removeAllChannels();
         console.log("🧹 Canales previos limpiados.");
-    } catch (e) {
-        console.error("Error limpiando canales:", e);
-    }
+    } catch (e) { console.error("Error limpiando:", e); }
 
-    isReconnectingDB = false; // Reiniciamos la bandera
-    console.log("🎧 Iniciando escucha de base de datos...");
-    const channelName = `bot_turnos_${Date.now()}`;
-    const channel = supabase.channel(channelName)
-        .on(
-            'postgres_changes',
-            { event: 'UPDATE', schema: 'public', table: 'turnos' },
-            async (payload) => {
-                // 1. LOG DE DEPURACIÓN (¡Esto es lo que necesitamos ver!)
-                console.log("📨 PAYLOAD RECIBIDO:", JSON.stringify(payload));
+    console.log("🎧 Intentando suscribirse a Supabase...");
 
-                const newTurn = payload.new;
-                
-                // 2. CONDICIÓN RELAJADA
-                // Si el estado NUEVO es 'en atencion', intentamos notificar.
-                // Quitamos la dependencia estricta de 'old' por si acaso.
-                if (newTurn.estado === 'en atencion') {
-                    console.log(`🔔 Detectado turno en atención: ${newTurn.prefijo_turno}-${newTurn.numero_turno}`);
-                    await notifyUser(newTurn);
-                }
+    const channel = supabase.channel('debug_room');
+
+    channel
+        .on('postgres_changes', { event: '*', schema: 'public' }, (payload) => {
+            // --- AQUÍ ESTÁ EL LOG QUE QUEREMOS VER ---
+            console.log("🔥 ¡ALGO PASÓ EN LA DB!");
+            console.log("TABLA:", payload.table);
+            console.log("EVENTO:", payload.eventType);
+            console.log("DATOS:", JSON.stringify(payload.new));
+            
+            if (payload.table === 'turnos' && payload.eventType === 'UPDATE') {
+                 handleTurnoUpdate(payload.new, payload.old);
             }
-        )
-        .subscribe((status) => {
+        })
+        .subscribe((status, err) => {
             console.log(`🔌 Estado Supabase: ${status}`);
-
-            if (status === 'SUBSCRIBED') {
-                isReconnectingDB = false; // ¡Conexión exitosa!
-            }
-
-            if (status === 'TIMED_OUT' || status === 'CLOSED' || status === 'CHANNEL_ERROR') {
-                if (isReconnectingDB) return; // Si ya estamos arreglándolo, no hacer nada (evita bucle)
-                
-                console.log("⚠️ Conexión DB inestable. Reiniciando listener en 10s...");
-                isReconnectingDB = true;
-                
-                // No llamamos a removeChannel aquí. Dejamos que muera solo y creamos uno nuevo después.
-                setTimeout(setupSupabaseListener, 10000);
-            }
+            if (err) console.error("❌ Error de suscripción:", err);
         });
+}
+
+async function handleTurnoUpdate(newTurn, oldTurn) {
+    console.log(`🔎 Analizando turno ${newTurn.id_turno}: ${oldTurn?.estado || '?'} -> ${newTurn.estado}`);
+    
+    if (newTurn.estado === 'en atencion') {
+        console.log("🔔 ¡CONDICIÓN CUMPLIDA! Buscando suscripción...");
+        await notifyUser(newTurn);
+    } else {
+        console.log("😴 No es un cambio a 'en atencion', ignorando.");
+    }
 }
 
 async function notifyUser(turnData) {
     if (!isConnected || !sock) {
-        console.log("⚠️ Intento de notificación fallido: WhatsApp desconectado.");
+        console.log("⚠️ WhatsApp desconectado, no se puede enviar.");
         return;
     }
+    console.log(`🔍 Buscando teléfono para turno ID: ${turnData.id_turno}`);
+    
     try {
-        const { data: sub } = await supabase.from('whatsapp_subscriptions').select('numero_whatsapp').eq('id_turno', turnData.id_turno).single();
-        if (!sub) return;
+        const { data: sub, error } = await supabase
+            .from('whatsapp_subscriptions')
+            .select('numero_whatsapp')
+            .eq('id_turno', turnData.id_turno)
+            .single();
 
-        const { data: mod } = await supabase.from('modulos').select('nombre_modulo').eq('id_modulo', turnData.id_modulo_atencion).single();
-        const modName = mod ? mod.nombre_modulo : "un módulo";
+        if (error) {
+            console.error("❌ Error buscando suscripción:", error.message);
+            return;
+        }
+        if (!sub) {
+            console.log("ℹ️ No se encontró suscripción para este turno.");
+            return;
+        }
+
+        console.log(`📞 Encontrado: ${sub.numero_whatsapp}. Buscando módulo...`);
+
+        const { data: mod } = await supabase
+            .from('modulos')
+            .select('nombre_modulo')
+            .eq('id_modulo', turnData.id_modulo_atencion)
+            .single();
         
+        const modName = mod ? mod.nombre_modulo : "un módulo";
         const jid = sub.numero_whatsapp.replace(/\D/g, '') + '@s.whatsapp.net';
         const texto = `🚨 *¡ES TU TURNO!* 🚨\n\nEl turno *${turnData.prefijo_turno}-${turnData.numero_turno}* ha sido llamado.\n➡️ Dirígete al *${modName}*.`;
         
+        console.log(`📤 Enviando mensaje a WhatsApp...`);
         await sock.sendMessage(jid, { text: texto });
-        console.log(`✅ Notificación enviada a ${sub.numero_whatsapp}`);
+        console.log(`✅ ¡Mensaje enviado con éxito!`);
+
     } catch (e) {
-        console.error("Error enviando:", e.message);
+        console.error("❌ Excepción en notifyUser:", e);
     }
 }
 
-// --- START ---
 app.listen(PORT, () => console.log(`Servidor Web listo en puerto ${PORT}`));
 connectToWhatsApp();
 setupSupabaseListener();
