@@ -1,3 +1,8 @@
+const crypto = require('crypto');
+if (!global.crypto) {
+    global.crypto = crypto;
+}
+
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
 const { createClient } = require('@supabase/supabase-js');
 const express = require('express');

@@ -1,4 +1,4 @@
-FROM node:18-bullseye-slim
+FROM node:20-bullseye-slim
 
 # Actualizamos e instalamos las dependencias del sistema
 # (He añadido 'git' y 'build-essential' al principio)
