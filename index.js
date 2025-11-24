@@ -18,7 +18,7 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 
 if (!SUPABASE_URL || !SUPABASE_KEY) {
-    console.error("❌ Error: Faltan las variables de entorno SUPABASE_URL o SUPABASE_KEY");
+    console.error("❌ Faltan variables de entorno");
     process.exit(1);
 }
 
@@ -41,6 +41,18 @@ app.get('/', async (req, res) => {
         `);
     }
     res.send('<h1 style="text-align:center; font-family:sans-serif;">Cargando... espera 10 segundos y recarga.</h1>');
+});
+
+app.get('/test', async (req, res) => {
+    const phone = req.query.phone;
+    if (!phone || !sock) return res.send("Error: Falta teléfono o bot desconectado");
+    try {
+        const jid = phone + '@s.whatsapp.net';
+        await sock.sendMessage(jid, { text: "🔔 ¡Hola! Prueba de conexión exitosa." });
+        res.send(`✅ Mensaje enviado a ${phone}`);
+    } catch (e) {
+        res.send(`❌ Error: ${e.message}`);
+    }
 });
 
 // --- LÓGICA WHATSAPP ---
