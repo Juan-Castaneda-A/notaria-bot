@@ -41,14 +41,18 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
     auth: { 
         persistSession: false,
-        autoRefreshToken: false
+        autoRefreshToken: false,
+        detectSessionInUrl: false
     },
     realtime: {
+        // Pasamos la llave como accessToken. Esto autentica el socket.
+        accessToken: async () => SUPABASE_KEY, 
+        
+        params: {
+            eventsPerSecond: 10,
+        },
         // Inyección explícita del WebSocket
         websocket: WebSocket,
-        headers: { 'apikey': SUPABASE_KEY },
-        params: { eventsPerSecond: 10 },
-        // Aumentamos tiempos para redes lentas
         timeout: 60000, 
         heartbeatIntervalMs: 15000 
     }
@@ -120,28 +124,35 @@ async function connectToWhatsApp() {
     sock.ev.on('creds.update', saveCreds);
 }
 
-// 7. LISTENER SUPABASE (EL DETECTIVE)
+// 7. LISTENER SUPABASE (VERSIÓN BLINDADA)
 let isReconnecting = false;
+let currentChannel = null;
 
 async function setupSupabaseListener() {
-    if (isReconnecting) {
-        console.log("🚫 (DB) Intento de reconexión bloqueado (ya hay uno en curso).");
-        return;
-    }
+    if (isReconnecting) return;
     isReconnecting = true;
 
-    console.log("🧹 (DB) Limpiando canales previos...");
-    await supabase.removeAllChannels();
+    console.log("🧹 (DB) Limpiando conexiones previas...");
+    
+    // Intentamos limpiar de forma segura
+    try {
+        if (currentChannel) await supabase.removeChannel(currentChannel);
+        // No usamos removeAllChannels porque es agresivo y causa el crash
+    } catch (e) {
+        console.error("⚠️ Error menor limpiando canal:", e.message);
+    }
 
-    console.log("🎧 (DB) Creando nuevo canal y suscribiendo...");
-    const channel = supabase.channel('bot_debug_room');
+    console.log("🎧 (DB) Creando nuevo canal...");
+    
+    // Usamos un nombre aleatorio para evitar conflictos de caché
+    const channelName = `bot_room_${Date.now()}`;
+    const channel = supabase.channel(channelName);
+    currentChannel = channel;
 
     channel
         .on('postgres_changes', { event: '*', schema: 'public', table: 'turnos' }, (payload) => {
-            // LOG SI LLEGA CUALQUIER COSA
             console.log("🔥 (DB) ¡EVENTO RECIBIDO!");
             console.log(`   > Tipo: ${payload.eventType}`);
-            console.log(`   > Turno ID: ${payload.new?.id_turno}`);
             
             if (payload.eventType === 'UPDATE' && payload.new.estado === 'en atencion') {
                 console.log("🔔 (DB) ¡Es un llamado! Procesando...");
@@ -149,24 +160,20 @@ async function setupSupabaseListener() {
             }
         })
         .subscribe((status, err) => {
-            // LOG DETALLADO DEL ESTADO
-            console.log(`🔌 (DB) Estado cambió a: ${status}`);
+            console.log(`🔌 (DB) Estado: ${status}`);
             
-            if (err) {
-                console.error("❌ (DB) ERROR CRÍTICO EN SUSCRIPCIÓN:");
-                console.error(err); // Imprimimos el objeto de error completo
-            }
-
             if (status === 'SUBSCRIBED') {
-                console.log("✅ (DB) ¡Conexión establecida y escuchando!");
-                isReconnecting = false; // Liberamos el bloqueo
+                console.log("✅ (DB) ¡Conectado y escuchando!");
+                isReconnecting = false; // ¡Éxito! Liberamos el bloqueo
             }
 
             if (status === 'TIMED_OUT' || status === 'CLOSED' || status === 'CHANNEL_ERROR') {
-                console.log("⚠️ (DB) Conexión perdida/fallida. Reintentando en 10s...");
-                // No liberamos isReconnecting aquí, esperamos al timeout
+                if (err) console.error("❌ Error de conexión:", err);
+                
+                // No reintentamos inmediatamente para evitar bucles rápidos
+                console.log("⚠️ (DB) Conexión fallida. Reintentando en 10s...");
                 setTimeout(() => {
-                    isReconnecting = false; // Ahora sí permitimos otro intento
+                    isReconnecting = false; // Liberamos bloqueo para permitir reintento
                     setupSupabaseListener();
                 }, 10000);
             }
