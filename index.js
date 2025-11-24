@@ -1,7 +1,5 @@
-// --- PARCHE DE CRIPTOGRAFÍA ---
 const crypto = require('crypto');
 if (!global.crypto) { global.crypto = crypto; }
-// -----------------------------
 
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers } = require('@whiskeysockets/baileys');
 const { createClient } = require('@supabase/supabase-js');
@@ -10,13 +8,12 @@ const QRCode = require('qrcode');
 const pino = require('pino');
 const fs = require('fs');
 
-// --- CONFIGURACIÓN ---
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000; // Render usa el puerto 10000 a veces
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 
 if (!SUPABASE_URL || !SUPABASE_KEY) {
-    console.error("❌ Error: Faltan variables de entorno.");
+    console.error("❌ Faltan variables de entorno.");
     process.exit(1);
 }
 
@@ -25,7 +22,7 @@ let qrCodeData = null;
 let sock = null;
 let isConnected = false;
 
-// --- SERVIDOR WEB ---
+// --- WEB ---
 app.get('/', async (req, res) => {
     if (isConnected) return res.send('<h1 style="color:green">✅ Bot Conectado</h1>');
     if (qrCodeData) {
@@ -65,19 +62,22 @@ async function connectToWhatsApp() {
 
         if (connection === 'close') {
             const statusCode = (lastDisconnect?.error)?.output?.statusCode;
-            console.log(`❌ WhatsApp Cerrado. Código: ${statusCode}`);
+            // Ignoramos el error 515 (Restart Required), es normal
+            if (statusCode !== 515) {
+                console.log(`❌ WhatsApp Cerrado. Código: ${statusCode}`);
+            }
             
             if (statusCode === 405) {
                 console.log("⚠️ Error 405. Limpiando sesión...");
                 try { fs.rmSync('auth_info_baileys', { recursive: true, force: true }); } catch(e){}
-                process.exit(1); // Reinicio total
+                process.exit(1); 
             }
             
             if (statusCode !== DisconnectReason.loggedOut) connectToWhatsApp();
             else isConnected = false;
 
         } else if (connection === 'open') {
-            console.log('✅ WhatsApp Conectado');
+            console.log('✅ ¡WhatsApp Conectado exitosamente!');
             isConnected = true;
             qrCodeData = null;
         }
@@ -85,28 +85,28 @@ async function connectToWhatsApp() {
     sock.ev.on('creds.update', saveCreds);
 }
 
-// --- SUPABASE LISTENER (CORREGIDO) ---
+// --- SUPABASE (VERSIÓN BLINDADA) ---
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
     auth: { persistSession: false }
 });
 
-let activeChannel = null; // Variable global para rastrear el canal activo
-let isReconnecting = false; // Semáforo para evitar bucles
+let isReconnectingDB = false;
 
 async function setupSupabaseListener() {
-    // 1. LIMPIEZA PREVIA (Aquí es seguro hacerlo)
-    if (activeChannel) {
-        console.log("🧹 Limpiando canal anterior...");
-        try { await supabase.removeChannel(activeChannel); } catch(e) {}
-        activeChannel = null;
+    // 1. Limpieza "Nuclear": Borrar TODOS los canales previos para evitar fantasmas
+    try {
+        await supabase.removeAllChannels();
+        console.log("🧹 Canales previos limpiados.");
+    } catch (e) {
+        console.error("Error limpiando canales:", e);
     }
 
+    isReconnectingDB = false; // Reiniciamos la bandera
     console.log("🎧 Iniciando escucha de base de datos...");
-    
-    // Usamos un nombre único para evitar conflictos de caché
-    const channelName = `bot_turnos_${Date.now()}`;
-    
-    const channel = supabase.channel(channelName)
+
+    const channel = supabase.channel('bot_turnos_v3');
+
+    channel
         .on(
             'postgres_changes',
             { event: 'UPDATE', schema: 'public', table: 'turnos' },
@@ -121,29 +121,29 @@ async function setupSupabaseListener() {
             }
         )
         .subscribe((status) => {
-            console.log(`🔌 Estado Supabase (${channelName}): ${status}`);
+            console.log(`🔌 Estado Supabase: ${status}`);
 
-            // 2. LÓGICA ANTI-BUCLE
+            if (status === 'SUBSCRIBED') {
+                isReconnectingDB = false; // ¡Conexión exitosa!
+            }
+
             if (status === 'TIMED_OUT' || status === 'CLOSED' || status === 'CHANNEL_ERROR') {
-                if (isReconnecting) return; // Ya estamos intentando, no hacer nada
+                if (isReconnectingDB) return; // Si ya estamos arreglándolo, no hacer nada (evita bucle)
                 
-                isReconnecting = true;
-                console.log("⚠️ Conexión DB perdida. Reintentando en 10 segundos...");
+                console.log("⚠️ Conexión DB inestable. Reiniciando listener en 10s...");
+                isReconnectingDB = true;
                 
-                // NO llamamos a removeChannel aquí. Dejamos que el canal muera solo.
-                // Solo programamos el siguiente intento.
-                setTimeout(() => {
-                    isReconnecting = false;
-                    setupSupabaseListener();
-                }, 10000);
+                // No llamamos a removeChannel aquí. Dejamos que muera solo y creamos uno nuevo después.
+                setTimeout(setupSupabaseListener, 10000);
             }
         });
-
-    activeChannel = channel;
 }
 
 async function notifyUser(turnData) {
-    if (!isConnected || !sock) return;
+    if (!isConnected || !sock) {
+        console.log("⚠️ Intento de notificación fallido: WhatsApp desconectado.");
+        return;
+    }
     try {
         const { data: sub } = await supabase.from('whatsapp_subscriptions').select('numero_whatsapp').eq('id_turno', turnData.id_turno).single();
         if (!sub) return;
@@ -155,7 +155,7 @@ async function notifyUser(turnData) {
         const texto = `🚨 *¡ES TU TURNO!* 🚨\n\nEl turno *${turnData.prefijo_turno}-${turnData.numero_turno}* ha sido llamado.\n➡️ Dirígete al *${modName}*.`;
         
         await sock.sendMessage(jid, { text: texto });
-        console.log(`✅ Enviado a ${sub.numero_whatsapp}`);
+        console.log(`✅ Notificación enviada a ${sub.numero_whatsapp}`);
     } catch (e) {
         console.error("Error enviando:", e.message);
     }
