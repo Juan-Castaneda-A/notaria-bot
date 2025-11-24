@@ -91,34 +91,43 @@ async function connectToWhatsApp() {
 }
 
 // --- LISTENER SUPABASE ---
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
+    auth: { persistSession: false } // Optimización para backend
+});
 
-function setupSupabaseListener() {
+async function setupSupabaseListener() {
     console.log("🎧 Iniciando escucha de base de datos...");
-    
-    supabase.channel('bot_debug_listener')
+
+    const channel = supabase.channel('bot_listener_v2');
+
+    channel
         .on(
             'postgres_changes',
-            { event: '*', schema: 'public', table: 'turnos' }, // Escucha TODO
+            { event: 'UPDATE', schema: 'public', table: 'turnos' },
             async (payload) => {
-                // 1. LOGUEA TODO LO QUE LLEGUE (Para ver si estamos sordos)
-                console.log(`📨 Evento recibido: ${payload.eventType}`, payload.new ? `ID: ${payload.new.id_turno}` : '');
+                console.log(`📨 Cambio detectado en turno ${payload.new.id_turno} (Estado: ${payload.new.estado})`);
+                
+                const newTurn = payload.new;
+                const oldTurn = payload.old;
 
-                // 2. Lógica real (solo UPDATE)
-                if (payload.eventType === 'UPDATE') {
-                    const newTurn = payload.new;
-                    const oldTurn = payload.old;
-                    
-                    // Verificamos el cambio de estado
-                    if (oldTurn.estado === 'en espera' && newTurn.estado === 'en atencion') {
-                        console.log(`🔔 ¡DETECTADO LLAMADO! Turno ${newTurn.numero_turno}`);
-                        await notifyUser(newTurn);
-                    }
+                // Verificamos si el estado cambió a 'en atencion'
+                if (oldTurn.estado === 'en espera' && newTurn.estado === 'en atencion') {
+                    console.log(`🔔 ¡TURNO LLAMADO! -> ${newTurn.prefijo_turno}-${newTurn.numero_turno}`);
+                    await notifyUser(newTurn);
                 }
             }
         )
         .subscribe((status) => {
-            console.log(`🔌 Estado de suscripción Supabase: ${status}`);
+            console.log(`🔌 Estado Supabase: ${status}`);
+
+            // --- LÓGICA DE RECONEXIÓN ---
+            if (status === 'TIMED_OUT' || status === 'CLOSED' || status === 'CHANNEL_ERROR') {
+                console.log("⚠️ Conexión con base de datos perdida. Reintentando en 5 segundos...");
+                // Quitamos el canal actual y probamos de nuevo
+                supabase.removeChannel(channel);
+                setTimeout(setupSupabaseListener, 5000);
+            }
+            // ---------------------------
         });
 }
 
