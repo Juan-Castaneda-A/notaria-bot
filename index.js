@@ -57,66 +57,36 @@ app.get('/test', async (req, res) => {
 
 // --- LÓGICA WHATSAPP ---
 async function connectToWhatsApp() {
-    // Usamos una carpeta para guardar sesión
     const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
-
     sock = makeWASocket({
         logger: pino({ level: 'silent' }),
-        printQRInTerminal: false, // Desactivado para limpiar logs
+        printQRInTerminal: false,
         auth: state,
-        // Usamos una firma de navegador más robusta
-        browser: Browsers.ubuntu("Chrome"), 
+        browser: Browsers.ubuntu("Chrome"),
         connectTimeoutMs: 60000,
     });
 
-    sock.ev.on('connection.update', async (update) => {
+    sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
+        if (qr) { console.log('👉 NUEVO QR GENERADO'); qrCodeData = qr; }
         
-        if (qr) {
-            console.log('👉 NUEVO QR GENERADO. Ve a la URL para escanear.');
-            qrCodeData = qr;
-        }
-
         if (connection === 'close') {
             const statusCode = (lastDisconnect?.error)?.output?.statusCode;
-            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-            
-            console.log(`❌ Conexión cerrada. Código: ${statusCode}`);
-
-            // CORRECCIÓN: Si es error 405, la sesión está corrupta. Borramos y reiniciamos.
+            console.log(`❌ Cerrado. Código: ${statusCode}`);
             if (statusCode === 405) {
-                console.log("⚠️ Error 405 (Sesión Inválida). Borrando credenciales y reiniciando contenedor...");
-                try {
-                    // Borramos la carpeta de sesión
-                    fs.rmSync('auth_info_baileys', { recursive: true, force: true });
-                    console.log("✅ Carpeta 'auth_info_baileys' eliminada.");
-                } catch (e) {
-                    console.error("❌ Fallo al borrar carpeta:", e);
-                }
-                
-                // ¡AQUÍ ESTÁ EL TRUCO! Matamos el proceso.
-                // Render detectará que se cerró y lo volverá a arrancar limpio en unos segundos.
-                process.exit(1); 
-                return;
-            }
-
-            isConnected = false;
-            if (shouldReconnect) {
-                console.log('🔄 Reconectando...');
-                setTimeout(connectToWhatsApp, 3000);
-            } else {
-                console.log('⛔ Desconectado permanentemente. Se requiere nuevo escaneo.');
-                // Borramos credenciales para permitir nuevo escaneo
+                console.log("⚠️ Error 405. Reiniciando...");
                 fs.rmSync('auth_info_baileys', { recursive: true, force: true });
-                connectToWhatsApp();
+                process.exit(1); // Muerte súbita para reiniciar limpio
             }
+            // Reconexión normal
+            if (statusCode !== DisconnectReason.loggedOut) connectToWhatsApp();
+            else isConnected = false;
         } else if (connection === 'open') {
             console.log('✅ ¡WhatsApp Conectado exitosamente!');
             isConnected = true;
             qrCodeData = null;
         }
     });
-
     sock.ev.on('creds.update', saveCreds);
 }
 
@@ -124,64 +94,65 @@ async function connectToWhatsApp() {
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 function setupSupabaseListener() {
-    console.log("🎧 Escuchando cambios en la tabla turnos...");
+    console.log("🎧 Iniciando escucha de base de datos...");
     
-    supabase.channel('bot_whatsapp_listener')
+    supabase.channel('bot_debug_listener')
         .on(
             'postgres_changes',
-            { event: 'UPDATE', schema: 'public', table: 'turnos' },
+            { event: '*', schema: 'public', table: 'turnos' }, // Escucha TODO
             async (payload) => {
-                const newTurn = payload.new;
-                const oldTurn = payload.old;
+                // 1. LOGUEA TODO LO QUE LLEGUE (Para ver si estamos sordos)
+                console.log(`📨 Evento recibido: ${payload.eventType}`, payload.new ? `ID: ${payload.new.id_turno}` : '');
 
-                // Solo si pasa de 'en espera' a 'en atencion'
-                if (oldTurn.estado === 'en espera' && newTurn.estado === 'en atencion') {
-                    console.log(`🔔 Turno llamado: ${newTurn.prefijo_turno}-${newTurn.numero_turno}`);
-                    await notifyUser(newTurn);
+                // 2. Lógica real (solo UPDATE)
+                if (payload.eventType === 'UPDATE') {
+                    const newTurn = payload.new;
+                    const oldTurn = payload.old;
+                    
+                    // Verificamos el cambio de estado
+                    if (oldTurn.estado === 'en espera' && newTurn.estado === 'en atencion') {
+                        console.log(`🔔 ¡DETECTADO LLAMADO! Turno ${newTurn.numero_turno}`);
+                        await notifyUser(newTurn);
+                    }
                 }
             }
         )
-        .subscribe();
+        .subscribe((status) => {
+            console.log(`🔌 Estado de suscripción Supabase: ${status}`);
+        });
 }
 
 async function notifyUser(turnData) {
-    if (!sock || !isConnected) {
-        console.log("⚠️ No se pudo enviar mensaje: Bot desconectado.");
-        return;
-    }
-
+    if (!isConnected) { console.log("⚠️ Bot desconectado, no se puede enviar."); return; }
+    
     try {
-        // 1. Buscar suscripción
-        const { data: sub, error } = await supabase
-            .from('whatsapp_subscriptions')
+        // Buscar suscripción
+        const { data: sub } = await supabase.from('whatsapp_subscriptions')
             .select('numero_whatsapp')
             .eq('id_turno', turnData.id_turno)
             .single();
 
-        if (error || !sub) return; // Nadie suscrito
+        if (!sub) {
+            console.log(`ℹ️ El turno ${turnData.id_turno} no tiene suscripción de WhatsApp.`);
+            return;
+        }
 
-        // 2. Buscar nombre del módulo
-        const { data: mod } = await supabase
-            .from('modulos')
+        // Buscar módulo
+        const { data: mod } = await supabase.from('modulos')
             .select('nombre_modulo')
             .eq('id_modulo', turnData.id_modulo_atencion)
             .single();
         
-        const moduloNombre = mod ? mod.nombre_modulo : "un módulo";
-        const turnoTexto = `${turnData.prefijo_turno}-${String(turnData.numero_turno).padStart(3, '0')}`;
-
-        // 3. Enviar
-        // Aseguramos formato internacional (ej: 57300...) -> 57300...@s.whatsapp.net
-        const numeroLimpio = sub.numero_whatsapp.replace(/\D/g, ''); 
-        const jid = numeroLimpio + '@s.whatsapp.net';
+        const modName = mod ? mod.nombre_modulo : "un módulo";
+        const numero = sub.numero_whatsapp.replace(/\D/g, '') + '@s.whatsapp.net';
         
-        const mensaje = `🚨 *¡ES TU TURNO!* 🚨\n\nEl turno *${turnoTexto}* está siendo llamado.\n➡️ Dirígete al *${moduloNombre}* ahora mismo.`;
-
-        await sock.sendMessage(jid, { text: mensaje });
-        console.log(`✅ Notificación enviada a ${numeroLimpio}`);
-
+        await sock.sendMessage(numero, { 
+            text: `🚨 *¡ES TU TURNO!* 🚨\n\nDirígete al *${modName}* ahora mismo.` 
+        });
+        console.log(`✅ Notificación enviada a ${sub.numero_whatsapp}`);
+        
     } catch (e) {
-        console.error("Error enviando notificación:", e);
+        console.error("Error lógica notificación:", e);
     }
 }
 
