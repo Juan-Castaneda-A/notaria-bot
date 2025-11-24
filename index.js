@@ -1,67 +1,90 @@
+// 1. PARCHES DEL SISTEMA (CRÍTICOS PARA RENDER)
+const crypto = require('crypto');
+if (!global.crypto) { global.crypto = crypto; }
+
+const WebSocket = require('ws');
+// Forzamos que sea global para que cualquier librería interna lo encuentre
+if (!global.WebSocket) { global.WebSocket = WebSocket; }
+
+// 2. IMPORTS
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers } = require('@whiskeysockets/baileys');
 const { createClient } = require('@supabase/supabase-js');
 const express = require('express');
 const QRCode = require('qrcode');
 const pino = require('pino');
 const fs = require('fs');
-// Importamos WS explícitamente
-const WebSocket = require('ws'); 
 
-// --- CONFIGURACIÓN ---
+// 3. VERIFICACIÓN DE ENTORNO (LOGS DETALLADOS)
+console.log("--- 🕵️ INICIANDO DIAGNÓSTICO DE ARRANQUE ---");
 const PORT = process.env.PORT || 10000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 
+console.log(`1. Puerto: ${PORT}`);
+console.log(`2. URL Supabase definida: ${!!SUPABASE_URL}`);
+if (SUPABASE_URL) console.log(`   > Valor: ${SUPABASE_URL}`);
+
+console.log(`3. Key Supabase definida: ${!!SUPABASE_KEY}`);
+if (SUPABASE_KEY) {
+    console.log(`   > Longitud: ${SUPABASE_KEY.length} caracteres`);
+    console.log(`   > Inicio: ${SUPABASE_KEY.substring(0, 10)}...`);
+    console.log(`   > ¿Es service_role?: ${!SUPABASE_KEY.includes('anon')}`); // Check rápido
+}
+
 if (!SUPABASE_URL || !SUPABASE_KEY) {
-    console.error("❌ Error Fatal: Faltan variables de entorno (URL o KEY).");
+    console.error("❌ ERROR FATAL: Faltan variables de entorno.");
     process.exit(1);
 }
 
+// 4. CONFIGURACIÓN SUPABASE
+// Usamos una configuración simplificada pero explícita para Node.js
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
+    auth: { 
+        persistSession: false,
+        autoRefreshToken: false
+    },
+    realtime: {
+        // Inyección explícita del WebSocket
+        websocket: WebSocket,
+        headers: { 'apikey': SUPABASE_KEY },
+        params: { eventsPerSecond: 10 },
+        // Aumentamos tiempos para redes lentas
+        timeout: 60000, 
+        heartbeatIntervalMs: 15000 
+    }
+});
+
+// 5. SERVIDOR WEB
 const app = express();
 let qrCodeData = null;
 let sock = null;
 let isConnected = false;
 
-// --- WEB SERVER ---
 app.get('/', async (req, res) => {
-    if (isConnected) return res.send('<h1 style="color:green; font-family:sans-serif;">✅ Bot Conectado y Operativo</h1>');
+    if (isConnected) return res.send('<h1 style="color:green">✅ Bot Conectado</h1>');
     if (qrCodeData) {
         const img = await QRCode.toDataURL(qrCodeData);
-        return res.send(`<div style="text-align:center; font-family:sans-serif;"><h1>Escanea el QR</h1><img src="${img}" /><br><p>Recarga la página si caduca.</p></div>`);
+        return res.send(`<div style="text-align:center"><h1>Escanea el QR</h1><img src="${img}" /></div>`);
     }
-    res.send('<h1 style="font-family:sans-serif;">Iniciando... espera 10 segundos y recarga.</h1>');
+    res.send('<h1>Cargando...</h1>');
 });
 
 app.get('/test', async (req, res) => {
     const phone = req.query.phone;
-    if (!phone || !sock) return res.send("Error: Bot desconectado o falta teléfono");
+    console.log(`🧪 Test solicitado para: ${phone}`);
+    if (!phone || !sock) return res.send("Error: Bot no listo");
     try {
         const jid = phone + '@s.whatsapp.net';
-        await sock.sendMessage(jid, { text: "🔔 Test de conexión exitoso." });
-        res.send(`Mensaje enviado a ${phone}`);
+        await sock.sendMessage(jid, { text: "🔔 Test OK" });
+        res.send("Enviado");
     } catch (e) {
         res.send(`Error: ${e.message}`);
     }
 });
 
-// --- SUPABASE CLIENT (CONFIGURACIÓN ROBUSTA) ---
-// Aquí está el cambio clave: Inyectamos el constructor de WebSocket
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
-    auth: { 
-        persistSession: false,
-        autoRefreshToken: false,
-    },
-    realtime: {
-        // ¡ESTA LÍNEA ARREGLA EL CHANNEL_ERROR!
-        // Le pasamos la librería 'ws' directamente a Supabase
-        headers: { apikey: SUPABASE_KEY }, // Refuerzo de seguridad
-        params: { eventsPerSecond: 10 },
-        websocket: WebSocket 
-    }
-});
-
-// --- LÓGICA WHATSAPP ---
+// 6. WHATSAPP (BAILEYS)
 async function connectToWhatsApp() {
+    console.log("🔄 (WA) Iniciando socket...");
     const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
     
     sock = makeWASocket({
@@ -74,31 +97,22 @@ async function connectToWhatsApp() {
 
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
-        
-        if (qr) {
-            console.log('👉 NUEVO QR GENERADO (Ve a la web para escanear)');
-            qrCodeData = qr;
-        }
+        if (qr) { console.log('👉 NUEVO QR GENERADO'); qrCodeData = qr; }
 
         if (connection === 'close') {
             const statusCode = (lastDisconnect?.error)?.output?.statusCode;
-            // Ignoramos el 515 (reinicio técnico)
-            if (statusCode !== 515) console.log(`❌ WhatsApp desconectado. Código: ${statusCode}`);
-
-            if (statusCode === 405) {
-                console.log("⚠️ Error 405 (Sesión inválida). Reiniciando limpio...");
-                try { fs.rmSync('auth_info_baileys', { recursive: true, force: true }); } catch(e){}
-                process.exit(1);
-            }
+            if (statusCode !== 515) console.log(`❌ (WA) Cerrado. Código: ${statusCode}`);
             
-            if (statusCode !== DisconnectReason.loggedOut) {
-                // Reconexión con delay para no saturar
-                setTimeout(connectToWhatsApp, 3000);
-            } else {
-                isConnected = false;
+            if (statusCode === 405) {
+                console.log("⚠️ (WA) Error 405. Reinicio forzado.");
+                try { fs.rmSync('auth_info_baileys', { recursive: true, force: true }); } catch(e){}
+                process.exit(1); 
             }
+            if (statusCode !== DisconnectReason.loggedOut) connectToWhatsApp();
+            else isConnected = false;
+
         } else if (connection === 'open') {
-            console.log('✅ ¡WhatsApp Conectado exitosamente!');
+            console.log('✅ (WA) ¡Conectado exitosamente!');
             isConnected = true;
             qrCodeData = null;
         }
@@ -106,69 +120,82 @@ async function connectToWhatsApp() {
     sock.ev.on('creds.update', saveCreds);
 }
 
-// --- LÓGICA DB LISTENER ---
-let listenerActive = false;
+// 7. LISTENER SUPABASE (EL DETECTIVE)
+let isReconnecting = false;
 
 async function setupSupabaseListener() {
-    if (listenerActive) return; // Evitar duplicados
-    listenerActive = true;
+    if (isReconnecting) {
+        console.log("🚫 (DB) Intento de reconexión bloqueado (ya hay uno en curso).");
+        return;
+    }
+    isReconnecting = true;
 
-    console.log("🎧 Configurando listener de base de datos...");
-
-    // Limpieza preventiva
+    console.log("🧹 (DB) Limpiando canales previos...");
     await supabase.removeAllChannels();
 
-    const channel = supabase.channel('bot_turnos_v4');
+    console.log("🎧 (DB) Creando nuevo canal y suscribiendo...");
+    const channel = supabase.channel('bot_debug_room');
 
     channel
-        .on(
-            'postgres_changes',
-            { event: 'UPDATE', schema: 'public', table: 'turnos' },
-            async (payload) => {
-                const newTurn = payload.new;
-                const oldTurn = payload.old;
-
-                // Filtro estricto: Solo cambios de 'en espera' a 'en atencion'
-                if (oldTurn.estado === 'en espera' && newTurn.estado === 'en atencion') {
-                    console.log(`🔔 DETECTADO LLAMADO: Turno ${newTurn.prefijo_turno}-${newTurn.numero_turno}`);
-                    await notifyUser(newTurn);
-                }
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'turnos' }, (payload) => {
+            // LOG SI LLEGA CUALQUIER COSA
+            console.log("🔥 (DB) ¡EVENTO RECIBIDO!");
+            console.log(`   > Tipo: ${payload.eventType}`);
+            console.log(`   > Turno ID: ${payload.new?.id_turno}`);
+            
+            if (payload.eventType === 'UPDATE' && payload.new.estado === 'en atencion') {
+                console.log("🔔 (DB) ¡Es un llamado! Procesando...");
+                notifyUser(payload.new);
             }
-        )
+        })
         .subscribe((status, err) => {
-            console.log(`🔌 Estado Supabase: ${status}`);
+            // LOG DETALLADO DEL ESTADO
+            console.log(`🔌 (DB) Estado cambió a: ${status}`);
             
-            if (status === 'CHANNEL_ERROR') {
-                console.error("❌ Error crítico de canal. Verifique credenciales.", err);
-                // No reintentamos en bucle rápido para no saturar logs
-                listenerActive = false;
-                setTimeout(setupSupabaseListener, 10000);
+            if (err) {
+                console.error("❌ (DB) ERROR CRÍTICO EN SUSCRIPCIÓN:");
+                console.error(err); // Imprimimos el objeto de error completo
             }
-            
-            if (status === 'TIMED_OUT' || status === 'CLOSED') {
-                console.log("⚠️ Conexión perdida. Reintentando...");
-                listenerActive = false;
-                setTimeout(setupSupabaseListener, 5000);
+
+            if (status === 'SUBSCRIBED') {
+                console.log("✅ (DB) ¡Conexión establecida y escuchando!");
+                isReconnecting = false; // Liberamos el bloqueo
+            }
+
+            if (status === 'TIMED_OUT' || status === 'CLOSED' || status === 'CHANNEL_ERROR') {
+                console.log("⚠️ (DB) Conexión perdida/fallida. Reintentando en 10s...");
+                // No liberamos isReconnecting aquí, esperamos al timeout
+                setTimeout(() => {
+                    isReconnecting = false; // Ahora sí permitimos otro intento
+                    setupSupabaseListener();
+                }, 10000);
             }
         });
 }
 
 async function notifyUser(turnData) {
     if (!isConnected || !sock) {
-        console.log("⚠️ No se envió mensaje: WhatsApp desconectado.");
+        console.log("⚠️ (Bot) No se envió mensaje: WhatsApp desconectado.");
         return;
     }
+    console.log(`🔍 (Bot) Buscando suscripción para Turno ${turnData.id_turno}...`);
+    
     try {
-        // 1. Buscar suscripción
         const { data: sub, error } = await supabase
             .from('whatsapp_subscriptions')
             .select('numero_whatsapp')
             .eq('id_turno', turnData.id_turno)
-            .single();
+            .maybeSingle(); // Usamos maybeSingle para evitar error si no hay fila
 
-        if (error || !sub) return; // No hay suscripción, no hacemos nada
+        if (error) {
+            console.error("❌ (Bot) Error Supabase al buscar suscripción:", error.message);
+            return;
+        }
+        if (!sub) {
+            console.log("ℹ️ (Bot) No hay suscripción para este turno.");
+            return;
+        }
 
-        // 2. Buscar nombre del módulo
         const { data: mod } = await supabase
             .from('modulos')
             .select('nombre_modulo')
@@ -176,21 +203,19 @@ async function notifyUser(turnData) {
             .single();
         
         const modName = mod ? mod.nombre_modulo : "un módulo";
-        const turnoTexto = `${turnData.prefijo_turno}-${String(turnData.numero_turno).padStart(3, '0')}`;
-        
-        // 3. Enviar mensaje
         const jid = sub.numero_whatsapp.replace(/\D/g, '') + '@s.whatsapp.net';
-        const mensaje = `🚨 *¡ES TU TURNO!* 🚨\n\nEl turno *${turnoTexto}* ha sido llamado.\n➡️ Dirígete al *${modName}*.`;
+        const texto = `🚨 *¡ES TU TURNO!* 🚨\n\nEl turno *${turnData.prefijo_turno}-${turnData.numero_turno}* ha sido llamado.\n➡️ Dirígete al *${modName}*.`;
         
-        await sock.sendMessage(jid, { text: mensaje });
-        console.log(`✅ Mensaje enviado a ${sub.numero_whatsapp}`);
+        console.log(`📤 (Bot) Enviando mensaje a ${sub.numero_whatsapp}...`);
+        await sock.sendMessage(jid, { text: texto });
+        console.log(`✅ (Bot) ¡Mensaje enviado!`);
 
     } catch (e) {
-        console.error("Error procesando notificación:", e.message);
+        console.error("❌ (Bot) Excepción en notifyUser:", e);
     }
 }
 
-// --- ARRANQUE ---
-app.listen(PORT, () => console.log(`Servidor Web listo en puerto ${PORT}`));
+// ARRANQUE
+app.listen(PORT, () => console.log(`🚀 Servidor Web listo en puerto ${PORT}`));
 connectToWhatsApp();
 setupSupabaseListener();
