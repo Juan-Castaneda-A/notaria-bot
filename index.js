@@ -30,30 +30,47 @@ app.get('/', async (req, res) => {
 });
 
 // --- LÓGICA WHATSAPP ---
+// --- LÓGICA WHATSAPP MEJORADA ---
 async function connectToWhatsApp() {
-    // Guardamos la sesión en una carpeta local (Nota: En Render Free esto se borra al reiniciar, hay que re-escanear)
     const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
 
     sock = makeWASocket({
         logger: pino({ level: 'silent' }),
-        printQRInTerminal: true, // También sale en los logs de Render
+        printQRInTerminal: true,
         auth: state,
-        browser: ["Notaria Bot", "Chrome", "1.0.0"]
+        // Usamos una configuración de navegador más estándar para evitar bloqueos
+        browser: ["Notaria Bot", "Chrome", "10.0.0"],
+        // Aumentamos el timeout para conexiones lentas
+        connectTimeoutMs: 60000, 
     });
 
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
         
         if (qr) {
-            console.log('NUEVO QR GENERADO');
-            qrCodeData = qr; // Guardamos para mostrar en la web
+            console.log('👉 NUEVO QR GENERADO. Ve a la URL para escanear.');
+            qrCodeData = qr; 
         }
 
         if (connection === 'close') {
-            const shouldReconnect = (lastDisconnect.error)?.output?.statusCode !== DisconnectReason.loggedOut;
-            console.log('Conexión cerrada. Reconectando...', shouldReconnect);
-            isConnected = false;
-            if (shouldReconnect) connectToWhatsApp();
+            // MEJORA: Obtenemos el código de error real
+            const reason = (lastDisconnect?.error)?.output?.statusCode;
+            const errorObj = lastDisconnect?.error;
+
+            console.log(`❌ Conexión cerrada. Razón: ${reason}`, errorObj);
+
+            const shouldReconnect = reason !== DisconnectReason.loggedOut;
+            
+            if (shouldReconnect) {
+                console.log('🔄 Reconectando en 5 segundos...');
+                // MEJORA: Esperamos 5 segundos antes de reintentar
+                setTimeout(connectToWhatsApp, 5000);
+            } else {
+                console.log('⛔ Desconectado permanentemente (Logout). Se requiere nuevo escaneo.');
+                // Opcional: Borrar credenciales para forzar nuevo QR
+                // fs.rmSync('auth_info_baileys', { recursive: true, force: true });
+                // connectToWhatsApp();
+            }
         } else if (connection === 'open') {
             console.log('✅ ¡WhatsApp Conectado exitosamente!');
             isConnected = true;
