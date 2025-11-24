@@ -5,7 +5,8 @@ const WebSocket = require('ws');
 if (!global.WebSocket) { global.WebSocket = WebSocket; }
 
 // 2. IMPORTS
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers } = require('@whiskeysockets/baileys');
+// --- AÑADIDO: jidNormalizedUser ---
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers, jidNormalizedUser } = require('@whiskeysockets/baileys');
 const { createClient } = require('@supabase/supabase-js');
 const express = require('express');
 const QRCode = require('qrcode');
@@ -13,7 +14,7 @@ const pino = require('pino');
 const fs = require('fs');
 
 // 3. CONFIGURACIÓN
-console.log("--- 🤖 INICIANDO BOT NOTARIA ---");
+console.log("--- 🤖 INICIANDO BOT NOTARIA (FIXED) ---");
 const PORT = process.env.PORT || 10000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
@@ -23,7 +24,7 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
     process.exit(1);
 }
 
-// 4. CLIENTE SUPABASE (ROBUSTO)
+// 4. CLIENTE SUPABASE
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
     auth: { persistSession: false, autoRefreshToken: false },
     realtime: {
@@ -50,7 +51,7 @@ app.get('/', async (req, res) => {
     res.send('<h1>Cargando...</h1>');
 });
 
-// 6. LÓGICA WHATSAPP (BAILEYS)
+// 6. LÓGICA WHATSAPP
 async function connectToWhatsApp() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
     
@@ -85,20 +86,22 @@ async function connectToWhatsApp() {
         }
     });
 
-    // --- AQUÍ ESTÁ LA MAGIA: ESCUCHAR MENSAJES ---
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
         if (type !== 'notify') return;
 
         for (const msg of messages) {
             if (!msg.message || msg.key.fromMe) continue;
 
-            const remoteJid = msg.key.remoteJid;
-            // Extraer texto de cualquier tipo de mensaje simple
+            const rawJid = msg.key.remoteJid;
             const text = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
 
             if (text) {
-                console.log(`📩 Mensaje de ${remoteJid}: ${text}`);
-                await handleIncomingMessage(remoteJid, text);
+                // --- CORRECCIÓN 1: NORMALIZAR EL ID ---
+                // Esto convierte '12345@lid' en '57300...@s.whatsapp.net'
+                const realJid = jidNormalizedUser(rawJid);
+                
+                console.log(`📩 Mensaje de ${realJid} (Raw: ${rawJid}): ${text}`);
+                await handleIncomingMessage(realJid, text);
             }
         }
     });
@@ -106,11 +109,10 @@ async function connectToWhatsApp() {
     sock.ev.on('creds.update', saveCreds);
 }
 
-// 7. PROCESAMIENTO DE MENSAJES DEL CLIENTE
+// 7. PROCESAMIENTO DE MENSAJES
 async function handleIncomingMessage(jid, text) {
     const cleanText = text.trim();
     
-    // A. Validación básica: ¿Parece una cédula? (Solo números, más de 5 dígitos)
     if (cleanText.length < 5 || !/^\d+$/.test(cleanText)) {
         await sock.sendMessage(jid, { 
             text: "👋 ¡Hola! Soy el asistente de turnos.\n\nPara avisarte cuando te llamen, por favor responde *únicamente con tu número de cédula* (sin puntos ni espacios)." 
@@ -118,14 +120,12 @@ async function handleIncomingMessage(jid, text) {
         return;
     }
 
-    // B. Buscar turno en Supabase
     const cedula = cleanText;
     console.log(`🔎 Buscando turno para cédula: ${cedula}`);
 
     try {
         const today = new Date().toISOString().split('T')[0];
         
-        // Buscamos turnos 'en espera' de hoy asociados a esa cédula
         const { data: turnos, error } = await supabase
             .from('turnos')
             .select('id_turno, prefijo_turno, numero_turno, id_servicio, hora_solicitud, clientes!inner(numero_identificacion)')
@@ -135,12 +135,7 @@ async function handleIncomingMessage(jid, text) {
             .order('hora_solicitud', { ascending: false })
             .limit(1);
 
-        if (error) {
-            console.error("❌ Error DB:", error.message);
-            return; 
-        }
-
-        if (!turnos || turnos.length === 0) {
+        if (error || !turnos || turnos.length === 0) {
             await sock.sendMessage(jid, { text: `❌ No encontré ningún turno *en espera* hoy para la cédula *${cedula}*.\n\nAsegúrate de haber solicitado tu turno en el Kiosco primero.` });
             return;
         }
@@ -148,23 +143,20 @@ async function handleIncomingMessage(jid, text) {
         const turno = turnos[0];
         const codigoTurno = `${turno.prefijo_turno}-${turno.numero_turno}`;
 
-        // C. Registrar suscripción en la tabla whatsapp_subscriptions
-        const numeroLimpio = jid.replace('@s.whatsapp.net', '');
+        // --- CORRECCIÓN 2: GUARDAR EL JID COMPLETO REAL ---
+        // Guardamos '57300...@s.whatsapp.net' directamente en la base de datos
         const { error: subError } = await supabase
             .from('whatsapp_subscriptions')
             .upsert({ 
                 id_turno: turno.id_turno, 
-                numero_whatsapp: numeroLimpio
-                // id_cliente es opcional si la tabla lo permite, o puedes sacarlo de turno.clientes
+                numero_whatsapp: jid // <-- Guardamos el JID normalizado
             }, { onConflict: 'id_turno' });
 
         if (subError) {
             console.error("❌ Error al suscribir:", subError.message);
-            await sock.sendMessage(jid, { text: "⚠️ Ocurrió un error al intentar suscribirte. Intenta de nuevo." });
             return;
         }
 
-        // D. Calcular personas por delante
         const { count } = await supabase
             .from('turnos')
             .select('id_turno', { count: 'exact', head: true })
@@ -172,7 +164,6 @@ async function handleIncomingMessage(jid, text) {
             .eq('id_servicio', turno.id_servicio)
             .lt('hora_solicitud', turno.hora_solicitud);
 
-        // E. Confirmar al usuario
         await sock.sendMessage(jid, { 
             text: `✅ *¡Turno Encontrado!*\n\n🎫 Tu turno: *${codigoTurno}*\n👥 Personas antes de ti: *${count || 0}*\n\n🔔 Te enviaré un mensaje por aquí apenas te llamen. ¡Puedes esperar tranquilo!` 
         });
@@ -183,7 +174,7 @@ async function handleIncomingMessage(jid, text) {
     }
 }
 
-// 8. LISTENER DE NOTIFICACIONES (DB -> WHATSAPP)
+// 8. LISTENER DE NOTIFICACIONES
 let isReconnectingDB = false;
 let currentChannel = null;
 
@@ -192,8 +183,6 @@ async function setupSupabaseListener() {
     isReconnectingDB = true;
 
     console.log("🎧 (DB) Configurando listener...");
-    
-    // Limpieza segura
     try { if (currentChannel) await supabase.removeChannel(currentChannel); } catch(e){}
 
     const channel = supabase.channel(`bot_notif_${Date.now()}`);
@@ -204,7 +193,6 @@ async function setupSupabaseListener() {
             const newTurn = payload.new;
             const oldTurn = payload.old;
 
-            // Detectar cambio a 'en atencion'
             if (oldTurn.estado === 'en espera' && newTurn.estado === 'en atencion') {
                 console.log(`🔔 LLAMADO DETECTADO: ${newTurn.prefijo_turno}-${newTurn.numero_turno}`);
                 await notifyUserCall(newTurn);
@@ -229,22 +217,17 @@ async function setupSupabaseListener() {
 async function notifyUserCall(turnData) {
     if (!isConnected || !sock) return;
     try {
-        // 1. Buscar suscripción
         const { data: sub } = await supabase.from('whatsapp_subscriptions').select('numero_whatsapp').eq('id_turno', turnData.id_turno).single();
-        
-        if (!sub) {
-            console.log(`ℹ️ Turno ${turnData.id_turno} sin suscripción.`);
-            return;
-        }
+        if (!sub) return;
 
-        // 2. Buscar módulo
         const { data: mod } = await supabase.from('modulos').select('nombre_modulo').eq('id_modulo', turnData.id_modulo_atencion).single();
         const modName = mod ? mod.nombre_modulo : "un módulo";
         
-        const jid = sub.numero_whatsapp.replace(/\D/g, '') + '@s.whatsapp.net';
         const texto = `🚨 *¡ES TU TURNO!* 🚨\n\nEl turno *${turnData.prefijo_turno}-${turnData.numero_turno}* ha sido llamado.\n➡️ Dirígete al *${modName}* ahora mismo.`;
         
-        await sock.sendMessage(jid, { text: texto });
+        // --- CORRECCIÓN 3: USAR EL NÚMERO TAL CUAL ---
+        // Ya viene con el formato correcto desde la base de datos
+        await sock.sendMessage(sub.numero_whatsapp, { text: texto });
         console.log(`✅ Notificación enviada a ${sub.numero_whatsapp}`);
 
     } catch (e) {
