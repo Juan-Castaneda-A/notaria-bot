@@ -1,5 +1,10 @@
 FROM node:18-bullseye-slim
+
+# Actualizamos e instalamos las dependencias del sistema
+# (He añadido 'git' y 'build-essential' al principio)
 RUN apt-get update && apt-get install -y \
+    git \
+    build-essential \
     gconf-service \
     libgbm-dev \
     libasound2 \
@@ -40,9 +45,20 @@ RUN apt-get update && apt-get install -y \
     xdg-utils \
     wget
 
+# Crear directorio de trabajo
 WORKDIR /app
+
+# Copiar archivos de configuración
 COPY package*.json ./
+
+# Instalar dependencias de Node (Ahora sí funcionará porque tenemos git)
 RUN npm install
+
+# Copiar el resto del código
 COPY . .
+
+# Exponer el puerto
 EXPOSE 3000
+
+# Arrancar
 CMD ["node", "index.js"]
