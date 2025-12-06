@@ -61,40 +61,56 @@ app.get('/', async (req, res) => {
     res.send('<h1>Cargando...</h1>');
 });
 
-// --- FUNCIÓN HELPER: AUTENTICACIÓN SUPABASE ---
+// --- AUTENTICACIÓN SUPABASE CON BUFFER (TURBO) ---
 async function useSupabaseAuthState(supabase) {
-    // Lógica para leer/escribir credenciales en la tabla 'wa_auth'
-    const writeData = async (data, key) => {
-        try {
-            // Convertimos el objeto a string, manejando los Buffers de Baileys
-            const value = JSON.stringify(data, BufferJSON.replacer);
-            if (key) {
-                await supabase.from('wa_auth').upsert({ key, value });
-            }
-        } catch (error) {
-            console.error('Error guardando auth:', error);
-        }
-    };
-
+    // Memoria caché local para velocidad instantánea
+    const memoryCache = {}; 
+    
+    // Función para leer de DB o Caché
     const readData = async (key) => {
+        if (memoryCache[key]) return memoryCache[key]; // Si está en RAM, devolverlo
         try {
             const { data } = await supabase.from('wa_auth').select('value').eq('key', key).single();
             if (data?.value) {
-                return JSON.parse(data.value, BufferJSON.reviver);
+                const parsed = JSON.parse(data.value, BufferJSON.reviver);
+                memoryCache[key] = parsed; // Guardar en caché
+                return parsed;
             }
             return null;
-        } catch (error) {
-            return null;
+        } catch (error) { return null; }
+    };
+
+    // Buffer de escritura (Cola de cambios pendientes)
+    let writeBuffer = {};
+    let saveInterval = null;
+
+    // Función que envía todo el buffer a Supabase de golpe
+    const flushBuffer = async () => {
+        const entries = Object.entries(writeBuffer);
+        if (entries.length === 0) return;
+
+        console.log(`💾 (DB) Guardando ${entries.length} claves en lote...`);
+        const upsertData = entries.map(([key, value]) => ({
+            key,
+            value: JSON.stringify(value, BufferJSON.replacer)
+        }));
+        
+        // Limpiamos el buffer local antes de enviar para evitar duplicados si la red es lenta
+        writeBuffer = {}; 
+
+        try {
+            await supabase.from('wa_auth').upsert(upsertData);
+        } catch (err) {
+            console.error('❌ Error guardando lote:', err.message);
+            // Si falla, podríamos intentar re-agregar al buffer, pero por ahora lo dejamos pasar para no bloquear
         }
     };
 
-    const removeData = async (key) => {
-        try {
-            await supabase.from('wa_auth').delete().eq('key', key);
-        } catch (error) { }
-    };
+    // Configurar el guardado automático cada 10 segundos
+    if (!saveInterval) {
+        saveInterval = setInterval(flushBuffer, 10000);
+    }
 
-    // Cargar credenciales iniciales
     const creds = (await readData('creds')) || initAuthCreds();
 
     return {
@@ -115,23 +131,29 @@ async function useSupabaseAuthState(supabase) {
                     return data;
                 },
                 set: async (data) => {
-                    const tasks = [];
+                    // AQUI ESTA LA MAGIA: No escribimos en DB, solo en memoria y buffer
                     for (const category in data) {
                         for (const id in data[category]) {
                             const value = data[category][id];
                             const key = `${category}-${id}`;
+                            
                             if (value) {
-                                tasks.push(writeData(value, key));
+                                memoryCache[key] = value; // Actualizar RAM
+                                writeBuffer[key] = value; // Encolar para guardar
                             } else {
-                                tasks.push(removeData(key));
+                                delete memoryCache[key];
+                                delete writeBuffer[key];
+                                try { await supabase.from('wa_auth').delete().eq('key', key); } catch(e){}
                             }
                         }
                     }
-                    await Promise.all(tasks);
                 }
             }
         },
-        saveCreds: () => writeData(creds, 'creds')
+        saveCreds: () => {
+            memoryCache['creds'] = creds;
+            writeBuffer['creds'] = creds;
+        }
     };
 }
 
@@ -147,7 +169,7 @@ async function connectToWhatsApp() {
         auth: state,
         
         // CAMBIO CLAVE 1: Browser personalizado para evitar bloqueos
-        browser: ["NotariaBot Server", "Chrome", "120.0.6099.199"],
+        browser: Browsers.ubuntu("Chrome"),
         
         // CAMBIO CLAVE 2: Desactivar cosas pesadas al inicio
         syncFullHistory: false, 
