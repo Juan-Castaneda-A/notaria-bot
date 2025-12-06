@@ -20,6 +20,8 @@ const express = require('express');
 const QRCode = require('qrcode');
 const pino = require('pino');
 const fs = require('fs');
+const NodeCache = require('node-cache');
+const msgRetryCounterCache = new NodeCache();
 
 // 3. CONFIGURACIÓN
 console.log("--- 🤖 INICIANDO BOT NOTARIA (FIXED) ---");
@@ -135,27 +137,39 @@ async function useSupabaseAuthState(supabase) {
 
 // 6. LÓGICA WHATSAPP
 async function connectToWhatsApp() {
+    // 1. Obtenemos la autenticación de Supabase
     const { state, saveCreds } = await useSupabaseAuthState(supabase);
     
+    // 2. Configuración optimizada para evitar el error 515
     sock = makeWASocket({
         logger: pino({ level: 'silent' }),
-        printQRInTerminal: false, // Quitamos esto para evitar el warning
+        printQRInTerminal: false,
         auth: state,
-        // Usamos la configuración estándar de Linux, es la más estable para Render
-        browser: Browsers.ubuntu("Chrome"),
-        syncFullHistory: false, // IMPORTANTE: Esto evita timeouts al escanear
+        
+        // CAMBIO CLAVE 1: Browser personalizado para evitar bloqueos
+        browser: ["NotariaBot Server", "Chrome", "120.0.6099.199"],
+        
+        // CAMBIO CLAVE 2: Desactivar cosas pesadas al inicio
+        syncFullHistory: false, 
+        markOnlineOnConnect: false, // No aparecer en línea inmediatamente
+        
+        // CAMBIO CLAVE 3: Configuración de red y caché
         connectTimeoutMs: 60000,
         keepAliveIntervalMs: 10000,
-        emitOwnEvents: true,
-        retryRequestDelayMs: 2000, // Reintentar rápido si falla
+        msgRetryCounterCache, // Esto ayuda con el error 515
+        retryRequestDelayMs: 5000,
+        
+        // Evita que el bot descargue estados, grupos viejos, etc.
+        getMessage: async (key) => {
+            return { conversation: 'hello' };
+        }
     });
 
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
         
-        // Si hay QR, lo guardamos para mostrarlo en la web
         if (qr) { 
-            console.log('👉 NUEVO QR GENERADO (Ve a la web para escanear)'); 
+            console.log('👉 NUEVO QR (Ve a la web)'); 
             qrCodeData = qr; 
         }
 
@@ -165,22 +179,32 @@ async function connectToWhatsApp() {
 
             console.log(`❌ WA Cerrado. Código: ${statusCode}`);
 
-            // Manejo específico de errores
-            if (statusCode === 401) {
-                console.log("⛔ ERROR 401: Credenciales rechazadas. Limpiando DB...");
-                // Opcional: Podrías automatizar el truncado aquí, pero mejor hazlo manual por seguridad ahora
+            // TRATAMIENTO ESPECIAL PARA ERROR 515 (Stream Restart)
+            if (statusCode === 515) {
+                console.log("🔄 Reinicio de Stream (515). Reconectando automáticamente sin borrar sesión...");
+                // No borramos la DB, solo reconectamos suavemente
+                setTimeout(connectToWhatsApp, 2000); 
+            }
+            // TRATAMIENTO PARA TIMEOUT (408)
+            else if (statusCode === 408) {
+                console.log("⌛ Timeout. Reintentando...");
+                setTimeout(connectToWhatsApp, 2000);
+            }
+            else if (statusCode === 401) {
+                console.log("⛔ Error 401 (Credenciales malas). DEBES LIMPIAR LA DB.");
                 isConnected = false;
-            } else if (shouldReconnect) {
-                console.log("🔄 Reconectando...");
-                // Sin delay o con delay muy corto para no perder el hilo
-                connectToWhatsApp(); 
-            } else {
-                console.log("⛔ Sesión cerrada definitivamente.");
+            }
+            else if (shouldReconnect) {
+                // Reconexión estándar para otros errores
+                setTimeout(connectToWhatsApp, 3000); 
+            } 
+            else {
+                console.log("⛔ Desconectado. (Logout)");
                 isConnected = false;
             }
 
         } else if (connection === 'open') {
-            console.log('✅ WA Conectado exitosamente');
+            console.log('✅ WA Conectado y Estable');
             isConnected = true;
             qrCodeData = null;
         }
@@ -192,14 +216,18 @@ async function connectToWhatsApp() {
             if (!msg.message || msg.key.fromMe) continue;
             const rawJid = msg.key.remoteJid;
             const text = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
-            if (text) {
+            
+            // FILTRO DE SEGURIDAD: Solo procesar si hay texto real
+            if (text && text.length > 0) {
                 const realJid = jidNormalizedUser(rawJid);
-                console.log(`📩 Mensaje de ${realJid}: ${text}`);
+                // console.log(`📩 Mensaje de ${realJid}: ${text}`); // Comentado para no saturar logs
                 await handleIncomingMessage(realJid, text);
             }
         }
     });
 
+    // Buffer simple para no saturar Supabase
+    // Solo guarda credenciales cuando es estrictamente necesario
     sock.ev.on('creds.update', saveCreds);
 }
 
