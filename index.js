@@ -136,63 +136,65 @@ async function useSupabaseAuthState(supabase) {
 // 6. LÓGICA WHATSAPP
 async function connectToWhatsApp() {
     const { state, saveCreds } = await useSupabaseAuthState(supabase);
-
+    
     sock = makeWASocket({
         logger: pino({ level: 'silent' }),
-        printQRInTerminal: true, // Pon esto en TRUE para ver si genera QR en los logs de Render
+        printQRInTerminal: false, // Quitamos esto para evitar el warning
         auth: state,
-        // CAMBIO 1: Usar un navegador personalizado ayuda a evitar desconexiones
-        browser: ["NotariaBot", "Chrome", "1.0.0"], 
-        // CAMBIO 2: Aumentar timeouts para conexiones lentas
-        connectTimeoutMs: 60000, 
-        defaultQueryTimeoutMs: undefined, // Dejar que espere indefinidamente si es necesario
+        // Usamos la configuración estándar de Linux, es la más estable para Render
+        browser: Browsers.ubuntu("Chrome"),
+        syncFullHistory: false, // IMPORTANTE: Esto evita timeouts al escanear
+        connectTimeoutMs: 60000,
         keepAliveIntervalMs: 10000,
         emitOwnEvents: true,
-        retryRequestDelayMs: 5000, // Esperar 5s antes de reintentar peticiones fallidas
+        retryRequestDelayMs: 2000, // Reintentar rápido si falla
     });
 
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
-        if (qr) { console.log('👉 NUEVO QR GENERADO'); qrCodeData = qr; }
+        
+        // Si hay QR, lo guardamos para mostrarlo en la web
+        if (qr) { 
+            console.log('👉 NUEVO QR GENERADO (Ve a la web para escanear)'); 
+            qrCodeData = qr; 
+        }
 
         if (connection === 'close') {
             const statusCode = (lastDisconnect?.error)?.output?.statusCode;
             const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
-            console.log(`❌ WA Cerrado. Código: ${statusCode}, Reconectar: ${shouldReconnect}`);
+            console.log(`❌ WA Cerrado. Código: ${statusCode}`);
 
-            // Si es un error 408 (Timeout) o conexión perdida, reconectamos
-            if (shouldReconnect) {
-                // IMPORTANTE: Destruir el socket anterior si existe para evitar duplicados
-                try { sock.end(); } catch(e) {} 
-                sock = null; 
-                
-                console.log("🔄 Reconectando en 5 segundos...");
-                setTimeout(connectToWhatsApp, 5000); // 5 segundos de espera real
-            } else {
-                console.log("⛔ Sesión cerrada definitivamente (Logout). Borra la tabla wa_auth y reinicia.");
+            // Manejo específico de errores
+            if (statusCode === 401) {
+                console.log("⛔ ERROR 401: Credenciales rechazadas. Limpiando DB...");
+                // Opcional: Podrías automatizar el truncado aquí, pero mejor hazlo manual por seguridad ahora
                 isConnected = false;
-                // Opcional: Limpiar la tabla wa_auth automáticamente si hay logout
-                // supabase.from('wa_auth').delete().neq('key', 'nothing'); 
+            } else if (shouldReconnect) {
+                console.log("🔄 Reconectando...");
+                // Sin delay o con delay muy corto para no perder el hilo
+                connectToWhatsApp(); 
+            } else {
+                console.log("⛔ Sesión cerrada definitivamente.");
+                isConnected = false;
             }
+
+        } else if (connection === 'open') {
+            console.log('✅ WA Conectado exitosamente');
+            isConnected = true;
+            qrCodeData = null;
         }
     });
 
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
         if (type !== 'notify') return;
-
         for (const msg of messages) {
             if (!msg.message || msg.key.fromMe) continue;
-
             const rawJid = msg.key.remoteJid;
             const text = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
-
             if (text) {
-                // --- CORRECCIÓN 1: NORMALIZAR EL ID ---
-                // Esto convierte '12345@lid' en '57300...@s.whatsapp.net'
                 const realJid = jidNormalizedUser(rawJid);
-
-                console.log(`📩 Mensaje de ${realJid} (Raw: ${rawJid}): ${text}`);
+                console.log(`📩 Mensaje de ${realJid}: ${text}`);
                 await handleIncomingMessage(realJid, text);
             }
         }
