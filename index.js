@@ -139,12 +139,16 @@ async function connectToWhatsApp() {
 
     sock = makeWASocket({
         logger: pino({ level: 'silent' }),
-        printQRInTerminal: false, // En Render es mejor false si usas la web
+        printQRInTerminal: true, // Pon esto en TRUE para ver si genera QR en los logs de Render
         auth: state,
-        browser: Browsers.ubuntu("Chrome"),
-        connectTimeoutMs: 60000,
+        // CAMBIO 1: Usar un navegador personalizado ayuda a evitar desconexiones
+        browser: ["NotariaBot", "Chrome", "1.0.0"], 
+        // CAMBIO 2: Aumentar timeouts para conexiones lentas
+        connectTimeoutMs: 60000, 
+        defaultQueryTimeoutMs: undefined, // Dejar que espere indefinidamente si es necesario
         keepAliveIntervalMs: 10000,
         emitOwnEvents: true,
+        retryRequestDelayMs: 5000, // Esperar 5s antes de reintentar peticiones fallidas
     });
 
     sock.ev.on('connection.update', (update) => {
@@ -153,20 +157,24 @@ async function connectToWhatsApp() {
 
         if (connection === 'close') {
             const statusCode = (lastDisconnect?.error)?.output?.statusCode;
-            if (statusCode !== 515) console.log(`❌ WA Cerrado. Código: ${statusCode}`);
+            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
-            if (statusCode === 405) {
-                console.log("⚠️ Error 405. Reinicio forzado.");
-                try { fs.rmSync('auth_info_baileys', { recursive: true, force: true }); } catch (e) { }
-                process.exit(1);
+            console.log(`❌ WA Cerrado. Código: ${statusCode}, Reconectar: ${shouldReconnect}`);
+
+            // Si es un error 408 (Timeout) o conexión perdida, reconectamos
+            if (shouldReconnect) {
+                // IMPORTANTE: Destruir el socket anterior si existe para evitar duplicados
+                try { sock.end(); } catch(e) {} 
+                sock = null; 
+                
+                console.log("🔄 Reconectando en 5 segundos...");
+                setTimeout(connectToWhatsApp, 5000); // 5 segundos de espera real
+            } else {
+                console.log("⛔ Sesión cerrada definitivamente (Logout). Borra la tabla wa_auth y reinicia.");
+                isConnected = false;
+                // Opcional: Limpiar la tabla wa_auth automáticamente si hay logout
+                // supabase.from('wa_auth').delete().neq('key', 'nothing'); 
             }
-            if (statusCode !== DisconnectReason.loggedOut) setTimeout(connectToWhatsApp, 3000);
-            else isConnected = false;
-
-        } else if (connection === 'open') {
-            console.log('✅ WA Conectado exitosamente');
-            isConnected = true;
-            qrCodeData = null;
         }
     });
 
